@@ -1,0 +1,625 @@
+import asyncio, aiohttp, ssl, time, os, sys, warnings, logging
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from urllib3.exceptions import InsecureRequestWarning
+
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# ⚙️ PROXY CONFIGURATION — ضع بروكسيك هنا
+# ============================================================
+# أمثلة:
+#   PROXY_URL = "socks5://IP:PORT"
+#   PROXY_URL = "socks5://USER:PASS@IP:PORT"
+#   PROXY_URL = "http://USER:PASS@IP:PORT"
+PROXY_URL = ""              # ← اتركه فارغاً لتعطيل البروكسي
+USE_PROXY = False           # ← True لتفعيل البروكسي
+PROXY_TIMEOUT = 15          # مهلة الاتصال عبر البروكسي
+
+
+# ============================================================
+# ⚙️ SESSION CONFIG
+# ============================================================
+bimo_int = 0.0001           # ping interval
+bimo_dley = 0.0001          # reconnect delay
+bimo_ses = 1                # عدد الجلسات لكل حساب
+
+
+# ============================================================
+# 🌐 ENDPOINTS
+# ============================================================
+LOGIN   = "https://loginbp.ppmainecoonghj.com"
+CLIENT  = "https://clientbp.ppmainecoonghj.com"
+INSPECT = "https://100067.connect.garena.com/oauth/token/inspect?token={t}"
+
+KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
+IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
+OB  = "OB55"
+VER = "2.132.5"
+
+PLATFORMS = ["8","3","5","6","11","13","4"]   # ✅ إصلاح: كان "" بدل "11"
+PNAMES = {"8":"Google","3":"Facebook","5":"VK","6":"Huawei","11":"X","13":"Apple","4":"Guest"}
+
+PING = bytes([0x0A,0x00,0x08,0x00,0x10,0x00,0x18,0x00,0x20,0x00,0x28,0x00,0x30,0x00,
+              0x38,0x00,0x40,0x00,0x48,0x00,0x50,0x00,0x58,0x00,0x60,0x00,0x68,0x00,
+              0x70,0x00,0x78,0x00,0x80,0x01,0x00])
+
+INSPECT_H = {
+    "Accept-Encoding":"gzip, deflate, br","Connection":"close",
+    "Content-Type":"application/x-www-form-urlencoded",
+    "Host":"100067.connect.garena.com",
+    "User-Agent":"GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)",
+}
+
+# ============================================================
+# 📌 GLOBAL SESSION STATE (متوافق مع bot.py)
+# ============================================================
+active_sessions = {}   # { account_id: {manager info + task} }
+
+
+# ============================================================
+# 🔐 PROTOBUF CODEC
+# ============================================================
+class Codec:
+    @staticmethod
+    def varint(n):
+        out=[]
+        while True:
+            b=n&0x7F; n>>=7
+            if n: b|=0x80
+            out.append(b)
+            if not n: break
+        return bytes(out)
+
+    @staticmethod
+    def encode(fields):
+        buf=bytearray()
+        for f,v in fields.items():
+            if isinstance(v,bool):
+                buf+=Codec.varint((f<<3)|0)+Codec.varint(int(v))
+            elif isinstance(v,int):
+                buf+=Codec.varint((f<<3)|0)+Codec.varint(v)
+            elif isinstance(v,str):
+                d=v.encode()
+                buf+=Codec.varint((f<<3)|2)+Codec.varint(len(d))+d
+            elif isinstance(v,(bytes,bytearray)):
+                d=bytes(v)
+                buf+=Codec.varint((f<<3)|2)+Codec.varint(len(d))+d
+        return bytes(buf)
+
+    @staticmethod
+    def decode(blob):
+        fields={}; i=0; n=len(blob)
+        while i<n:
+            try: key,i=Codec.readvarint(blob,i)
+            except: break
+            fn,wt=key>>3,key&0x07
+            try:
+                if wt==0: val,i=Codec.readvarint(blob,i)
+                elif wt==2:
+                    ln,i=Codec.readvarint(blob,i)
+                    val=blob[i:i+ln]; i+=ln
+                elif wt==5: val=blob[i:i+4]; i+=4
+                elif wt==1: val=blob[i:i+8]; i+=8
+                else: break
+            except: break
+            fields.setdefault(fn,[]).append(val)
+        return fields
+
+    @staticmethod
+    def readvarint(blob,i):
+        res=0; sh=0
+        while i<len(blob):
+            b=blob[i]; i+=1
+            res|=(b&0x7F)<<sh
+            if not (b&0x80): break
+            sh+=7
+        return res,i
+
+
+# ============================================================
+# 🔒 SSL & CONNECTOR
+# ============================================================
+def sslctx():
+    c=ssl.create_default_context()
+    c.check_hostname=False
+    c.verify_mode=ssl.CERT_NONE
+    return c
+
+
+def dec(data,key,iv):
+    try: return unpad(AES.new(key,AES.MODE_CBC,iv).decrypt(data),16)
+    except: return None
+
+
+_conn=None
+def conn():
+    global _conn
+    if _conn is None or _conn.closed:
+        _conn=aiohttp.TCPConnector(ssl=sslctx(),limit=0,limit_per_host=0,
+                                   ttl_dns_cache=300,force_close=False)
+    return _conn
+
+
+# ============================================================
+# 🧦 PROXY TCP CONNECTOR (لكي تعمل جلسات اللعبة عبر البروكسي)
+# ============================================================
+async def open_connection_via_proxy(host, port, timeout=5):
+    """
+    يفتح اتصال TCP مباشر أو عبر بروكسي (SOCKS5/HTTP) حسب الإعدادات.
+    """
+    if USE_PROXY and PROXY_URL:
+        try:
+            from python_socks.async_.asyncio import Proxy
+            proxy = Proxy.from_url(PROXY_URL)
+            sock = await proxy.connect(
+                dest_host=host,
+                dest_port=int(port),
+                timeout=PROXY_TIMEOUT
+            )
+            return await asyncio.wait_for(
+                asyncio.open_connection(sock=sock),
+                timeout=timeout
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Proxy connection failed ({host}:{port}): {e}")
+            raise
+    return await asyncio.wait_for(
+        asyncio.open_connection(host, int(port)),
+        timeout=timeout
+    )
+
+
+# ============================================================
+# 🔍 INSPECT TOKEN
+# ============================================================
+async def inspect(session,token):
+    try:
+        kwargs = {
+            "headers": INSPECT_H,
+            "ssl": sslctx(),
+            "timeout": aiohttp.ClientTimeout(total=8)
+        }
+        if USE_PROXY and PROXY_URL:
+            kwargs["proxy"] = PROXY_URL
+
+        async with session.get(INSPECT.format(t=token), **kwargs) as r:
+            if r.status!=200: return None,None
+            d=await r.json(content_type=None)
+            if "error" in d: return None,None
+            return d.get("open_id"),d.get("platform",4)
+    except Exception as e:
+        logger.debug(f"Inspect failed: {e}")
+        return None,None
+
+
+# ============================================================
+# 📦 BUILD MAJOR LOGIN PAYLOAD
+# ============================================================
+def build_major(open_id,token,platform):
+    fields={
+        3:time.strftime("%Y-%m-%d %H:%M:%S"),4:"free fire",5:1,7:VER,
+        8:"Android OS 15 / API-35",9:"Handheld",10:"TUNTEL",11:"WIFI",
+        12:1600,13:719,14:"234",15:"ARM64 FP ASIMD AES | 1820 | 8",16:2798,
+        17:"Mali-G57",18:"OpenGL ES 3.2",
+        19:"Google|f744e396-5694-4e65-995d-97a958f2bd1f",
+        20:"197.0.137.129",21:"pt-br",22:open_id,23:platform,24:"Handheld",
+        25:"INFINIX Infinix X6725",26:"ME",29:token,30:1,
+        41:"TUNTEL",42:"WIFI",57:"7428b253defc164018c604a1ebbfebdf",
+        60:49973,61:11338,62:854,64:11466,73:2,76:1,78:3,79:2,
+        81:"64",83:"2019118524",85:3,86:"OpenGLES2",87:8191,88:4,
+        92:15078,93:"android",95:111207,97:1,99:platform,100:platform,
+        102:b"\x17]ENWU\x0eR5",104:52882,105:1,
+    }
+    return AES.new(KEY,AES.MODE_CBC,IV).encrypt(pad(Codec.encode(fields),16))
+
+
+# ============================================================
+# 🚀 MAJOR LOGIN
+# ============================================================
+async def major_login(session,payload):
+    h={"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+       "Accept":"*/*","Accept-Encoding":"deflate, gzip",
+       "X-GA-SV":str(int(time.time())),"Authorization":"Bearer","X-GA":"v1 1",
+       "ReleaseVersion":OB,"Content-Type":"application/x-www-form-urlencoded",
+       "X-Unity-Version":"2018.4.12f1"}
+    try:
+        kwargs = {
+            "data": payload,
+            "headers": h,
+            "ssl": sslctx(),
+            "timeout": aiohttp.ClientTimeout(total=10)
+        }
+        if USE_PROXY and PROXY_URL:
+            kwargs["proxy"] = PROXY_URL
+
+        async with session.post(f"{LOGIN}/MajorLogin", **kwargs) as r:
+            if r.status==200: return await r.read()
+    except Exception as e:
+        logger.debug(f"MajorLogin failed: {e}")
+    return None
+
+
+# ============================================================
+# 📥 GET LOGIN DATA
+# ============================================================
+async def login_data(session,payload,tok):
+    h={"Host":"clientbp.ppmainecoonghj.com",
+       "User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+       "Accept":"*/*","Accept-Encoding":"deflate, gzip",
+       "X-GA-SV":str(int(time.time())),"Authorization":f"Bearer {tok}",
+       "X-GA":"v1 1","ReleaseVersion":OB,
+       "Content-Type":"application/x-www-form-urlencoded",
+       "X-Unity-Version":"2018.4.12f1"}
+    try:
+        kwargs = {
+            "data": payload,
+            "headers": h,
+            "ssl": sslctx(),
+            "timeout": aiohttp.ClientTimeout(total=10)
+        }
+        if USE_PROXY and PROXY_URL:
+            kwargs["proxy"] = PROXY_URL
+
+        async with session.post(f"{CLIENT}/GetLoginData", **kwargs) as r:
+            if r.status==200: return await r.read()
+    except Exception as e:
+        logger.debug(f"GetLoginData failed: {e}")
+    return None
+
+
+# ============================================================
+# 🧩 PARSERS
+# ============================================================
+def parse_major(raw):
+    for off in (0,4,8,12,16,20,24,28,32,48,64):
+        b=raw[off:]
+        if len(b)<32: continue
+        f=Codec.decode(b)
+        if 1 in f and 8 in f and 22 in f and 23 in f: return f
+    return None
+
+
+def parse_ld(raw,key,iv):
+    for off in (0,4,8,12,16,24,32,48,64):
+        b=raw[off:]
+        if len(b)<16: continue
+        d=dec(b,key,iv)
+        if d:
+            f=Codec.decode(d)
+            if f and (14 in f or 32 in f or 4 in f): return f
+    for off in (0,4,8,16,32,64):
+        f=Codec.decode(raw[off:])
+        if f and (14 in f or 32 in f or 4 in f): return f
+    return None
+
+
+def build_auth(acc_id,tok,ts,key,iv):
+    e=AES.new(key,AES.MODE_CBC,iv).encrypt(pad(tok.encode(),16))
+    return (bytes.fromhex("7319")+int(acc_id).to_bytes(8,"big")+
+            int(ts).to_bytes(4,"big")+b"\x00\x00\x00\x00"+
+            len(e).to_bytes(4,"big")+e)
+
+
+# ============================================================
+# 🔑 AUTHENTICATE (all platforms)
+# ============================================================
+async def authenticate(session,token,open_id,pref=None):
+    plats=list(PLATFORMS)
+    if pref and str(pref) in plats:
+        plats.remove(str(pref)); plats.insert(0,str(pref))
+
+    for plat in plats:
+        payload=build_major(open_id,token,plat)
+        lg=await major_login(session,payload)
+        if not lg: continue
+        f=parse_major(lg)
+        if not f: continue
+
+        acc_id=int(f[1][0])
+        jwt=f[8][0].decode()
+        ts=int(f[21][0])
+        k=bytes(f[22][0]) if isinstance(f[22][0],(bytes,bytearray)) and len(f[22][0])==16 else None
+        v=bytes(f[23][0]) if isinstance(f[23][0],(bytes,bytearray)) and len(f[23][0])==16 else None
+        if not k or not v: continue
+
+        data=await login_data(session,payload,jwt)
+        if not data: continue
+        g=parse_ld(data,k,v)
+        if not g: continue
+
+        name=""
+        if 4 in g:
+            try: name=g[4][0].decode()
+            except: pass
+        func=g[14][0].decode() if 14 in g else None
+        info=g[32][0].decode() if 32 in g else None
+        if not func or not info: continue
+
+        return {
+            "uid":acc_id,"name":name,"open_id":open_id,
+            "online":func,"chat":info,
+            "auth":build_auth(acc_id,jwt,ts,k,v),
+            "pname":PNAMES.get(plat,plat),"pid":plat,
+        }
+    return None
+
+
+# ============================================================
+# 🔌 SESSION HANDLER (يدعم البروكسي)
+# ============================================================
+class Session:
+    def __init__(self,d,i):
+        self.d=d; self.i=i
+        self.or_=None; self.ow=None
+        self.cr=None; self.cw=None
+        self.on=False; self.rc=0
+
+    async def _co(self):
+        ip,pt=self.d['online'].split(':')
+        try:
+            self.or_,self.ow=await open_connection_via_proxy(ip,pt,timeout=5)
+            self.ow.write(self.d['auth']); await self.ow.drain(); return True
+        except Exception as e:
+            logger.debug(f"Session {self.i} online connect failed: {e}")
+            return False
+
+    async def _cc(self):
+        ip,pt=self.d['chat'].split(':')
+        try:
+            self.cr,self.cw=await open_connection_via_proxy(ip,pt,timeout=5)
+            self.cw.write(self.d['auth']); await self.cw.drain(); return True
+        except Exception as e:
+            logger.debug(f"Session {self.i} chat connect failed: {e}")
+            return False
+
+    async def _ping(self):
+        while self.on:
+            try:
+                await asyncio.sleep(bimo_int)
+                if self.ow and not self.ow.is_closing():
+                    self.ow.write(PING); await self.ow.drain()
+                if self.cw and not self.cw.is_closing():
+                    self.cw.write(PING); await self.cw.drain()
+            except:
+                self.on=False; break
+
+    async def _ro(self):
+        while self.on:
+            try:
+                d=await self.or_.read(4096)
+                if not d: self.on=False; break
+            except: self.on=False; break
+
+    async def _rc(self):
+        while self.on:
+            try:
+                d=await self.cr.read(4096)
+                if not d: self.on=False; break
+            except: self.on=False; break
+
+    async def start(self):
+        ok=await asyncio.gather(self._co(),self._cc())
+        if not all(ok):
+            self.rc+=1; return False
+        self.on=True
+        try:
+            await asyncio.gather(self._ro(),self._rc(),self._ping())
+        except: pass
+        return True
+
+    async def stop(self):
+        self.on=False
+        try:
+            if self.ow: self.ow.close()
+            if self.cw: self.cw.close()
+        except: pass
+
+
+async def run_sessions(d, stop_event=None):
+    sessions=[Session(d,i+1) for i in range(bimo_ses)]
+    async def worker(s):
+        while True:
+            if stop_event and stop_event.is_set():
+                await s.stop()
+                return
+            try:
+                ok=await s.start()
+                await asyncio.sleep(bimo_dley if not ok else 0.05)
+            except asyncio.CancelledError:
+                await s.stop()
+                return
+            except:
+                await asyncio.sleep(bimo_dley)
+    try:
+        await asyncio.gather(*[worker(s) for s in sessions])
+    except asyncio.CancelledError:
+        for s in sessions:
+            await s.stop()
+        raise
+
+
+# ============================================================
+# 🎯 MAIN — الدالة الأساسية التي يديرها البوت
+# ============================================================
+async def login_loop(access_token, stop_event=None):
+    """
+    الدالة الرئيسية: تستخرج Open ID + تصادق + تفتح الجلسات
+    وترجع بيانات الحساب عند النجاح، أو None عند الفشل.
+    """
+    async with aiohttp.ClientSession(connector=conn()) as session:
+        open_id,pref=await inspect(session,access_token)
+        if not open_id:
+            logger.warning("❌ فشل استخراج Open ID")
+            return None
+
+        d=await authenticate(session,access_token,open_id,pref)
+        if not d:
+            logger.warning("❌ فشلت المصادقة على جميع المنصات")
+            return None
+
+        logger.info(f"✅ Login OK: {d['name']} | UID={d['uid']} | Platform={d['pname']}")
+
+        # شغّل الجلسات في الخلفية
+        try:
+            await run_sessions(d, stop_event=stop_event)
+        except asyncio.CancelledError:
+            logger.info(f"🛑 Sessions cancelled for UID {d['uid']}")
+            raise
+
+        return d
+
+
+# ============================================================
+# 🎛️ BOT-COMPATIBLE INTERFACE
+# ============================================================
+def is_session_active(account_id: str) -> bool:
+    """هل الجلسة نشطة لهذا الحساب؟"""
+    return str(account_id) in active_sessions
+
+
+async def start_login_session(access_token: str, account_id: str = "", user_id: str = ""):
+    """
+    يُستدعى من bot.py:
+        success, result = await spam_manager.start_login_session(access_token, account_id=aid)
+    """
+    global active_sessions
+    aid = str(account_id)
+
+    if aid and aid in active_sessions:
+        return False, "⚠️ جلسة تسجيل دخول نشطة بالفعل لهذا الحساب!"
+
+    # نُشغّل المصادقة في thread منفصل حتى لا يجمّد البوت إذا استخدمنا requests
+    # لكن هنا نستخدم aiohttp فالأمر async بشكل أصلي
+    stop_event = asyncio.Event()
+
+    # مهمة مؤقتة للمصادقة لاستخراج البيانات
+    auth_result = {}
+
+    async def _auth_task():
+        async with aiohttp.ClientSession(connector=conn()) as session:
+            open_id, pref = await inspect(session, access_token)
+            if not open_id:
+                auth_result["error"] = "❌ فشل استخراج Open ID (تحقق من التوكن أو البروكسي)"
+                return
+            d = await authenticate(session, access_token, open_id, pref)
+            if not d:
+                auth_result["error"] = "❌ فشل تسجيل الدخول على جميع المنصات!"
+                return
+            auth_result["data"] = d
+
+    try:
+        await asyncio.wait_for(_auth_task(), timeout=60)
+    except asyncio.TimeoutError:
+        return False, "⏰ انتهت مدة محاولة تسجيل الدخول (60 ثانية)"
+
+    if "error" in auth_result:
+        return False, auth_result["error"]
+
+    d = auth_result["data"]
+    acc_uid = d["uid"]
+    if not aid:
+        aid = str(acc_uid)
+
+    # شغّل الجلسات في الخلفية
+    task = asyncio.create_task(run_sessions(d, stop_event=stop_event))
+
+    active_sessions[aid] = {
+        "task": task,
+        "stop_event": stop_event,
+        "name": d["name"],
+        "uid": str(acc_uid),
+        "platform": d["pname"],
+        "user_id": str(user_id),
+        "data": d,
+    }
+
+    return True, d
+
+
+async def stop_login_session(account_id: str):
+    """
+    يُستدعى من bot.py:
+        success, msg = await spam_manager.stop_login_session(aid)
+    """
+    global active_sessions
+    aid = str(account_id)
+
+    if aid not in active_sessions:
+        return False, "⚠️ لا توجد جلسة نشطة لهذا الحساب لإيقافها!"
+
+    sess = active_sessions[aid]
+    task = sess.get("task")
+    stop_event = sess.get("stop_event")
+
+    # 1) إشارة إيقاف نظيفة
+    if stop_event:
+        stop_event.set()
+
+    # 2) إلغاء المهمة
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # 3) حذف من السجل
+    del active_sessions[aid]
+
+    return True, "✅ **تم إيقاف جلسة تسجيل الدخول بنجاح!**"
+
+
+def get_login_status() -> str:
+    """يُستدعى من bot.py لعرض حالة الجلسات."""
+    if not active_sessions:
+        return "🔴 **لا توجد جلسات نشطة حالياً**"
+
+    lines = []
+    for aid, s in active_sessions.items():
+        task_status = "🟢" if (s.get("task") and not s["task"].done()) else "🔴"
+        lines.append(
+            f"{task_status} <b>{s['name']}</b> (UID: {s['uid']}) [{s['platform']}]"
+        )
+    return "\n".join(lines)
+
+
+# ============================================================
+# 🧪 STANDALONE MODE (اختباري - يعمل مستقلاً بدون bot.py)
+# ============================================================
+async def main(token):
+    stop_event = asyncio.Event()
+    d = await login_loop(token, stop_event=stop_event)
+    if not d:
+        print("X فشلت العملية")
+        return
+    print(f"Name    : {d['name']}")
+    print(f"UID     : {d['uid']}")
+    print(f"Platform: {d['pname']} ({d['pid']})")
+    print(f"Open ID : {d['open_id']}")
+    print(f"Online  : {d['online']}")
+    print(f"Chat    : {d['chat']}")
+    print(f"Status  : SUCCESS")
+    print(f"Sessions: {bimo_ses} | Ping: {bimo_int}s")
+    print()
+
+
+def start():
+    try:
+        if not sys.stdin.isatty():
+            token = sys.stdin.readline().strip()
+        else:
+            token = input("Access Token : ").strip()
+        if not token: return
+        while True:
+            try: asyncio.run(main(token))
+            except KeyboardInterrupt: return
+            except: time.sleep(0.5)
+    except KeyboardInterrupt: pass
+
+
+if __name__=="__main__":
+    os.system('clear' if os.name=='posix' else 'cls')
+    start()
